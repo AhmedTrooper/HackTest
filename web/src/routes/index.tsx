@@ -56,12 +56,13 @@ const PRIORITIES = ["Low", "Medium", "High"];
 function SubmissionsDashboard() {
 	// State for backend connection
 	const [backendUrl, setBackendUrl] = useState(() => {
+		const defaultUrl = (import.meta.env.VITE_API_URL as string) || "http://localhost:8080";
 		if (typeof window !== "undefined") {
 			return (
-				localStorage.getItem("hack_backend_url") || "http://localhost:8080"
+				localStorage.getItem("hack_backend_url") || defaultUrl
 			);
 		}
-		return "http://localhost:8080";
+		return defaultUrl;
 	});
 	const [showSettings, setShowSettings] = useState(false);
 	const [connectionStatus, setConnectionStatus] = useState<
@@ -639,7 +640,7 @@ function SubmissionsDashboard() {
 							<button
 								type="submit"
 								disabled={
-									isSubmitting || isUploading || connectionStatus === "failed"
+									isSubmitting || isUploading
 								}
 								className="w-full py-2.5 rounded-xl bg-[var(--sea-ink)] hover:bg-[var(--sea-ink-soft)] text-white font-bold text-sm shadow-sm transition disabled:opacity-50 flex items-center justify-center gap-2 cursor-pointer"
 							>

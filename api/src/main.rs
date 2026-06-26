@@ -14,6 +14,11 @@ use tokio::sync::RwLock;
 use tower_http::cors::{Any, CorsLayer};
 use uuid::Uuid;
 
+// SQLx and AWS S3 imports
+use aws_config::BehaviorVersion;
+use aws_sdk_s3::primitives::ByteStream;
+use sqlx::Row;
+
 const MAX_UPLOAD_SIZE: usize = 10 * 1024 * 1024; // 10 MB
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -87,8 +92,11 @@ pub struct UploadMetadata {
 
 #[derive(Clone)]
 pub struct AppState {
-    pub submissions: Arc<RwLock<Vec<Submission>>>,
-    pub uploads: Arc<RwLock<HashMap<Uuid, UploadMetadata>>>,
+    pub db: Option<sqlx::PgPool>,
+    pub s3_client: Option<aws_sdk_s3::Client>,
+    pub s3_bucket: String,
+    pub submissions_mem: Arc<RwLock<Vec<Submission>>>,
+    pub uploads_mem: Arc<RwLock<HashMap<Uuid, UploadMetadata>>>,
 }
 
 #[derive(Debug, Serialize)]
@@ -161,6 +169,9 @@ pub struct SubmissionListResponse {
 
 #[tokio::main]
 async fn main() {
+    // Load environment variables from .env file (traverses up parent directories)
+    dotenvy::dotenv().ok();
+
     // Set up logging
     tracing_subscriber::fmt()
         .with_env_filter(tracing_subscriber::EnvFilter::new(
@@ -168,42 +179,143 @@ async fn main() {
         ))
         .init();
 
-    // Create uploads directory
+    // Create uploads directory (local disk fallback)
     tokio::fs::create_dir_all("./uploads")
         .await
         .expect("Failed to create uploads directory");
 
+    // 1. Initialize PostgreSQL (if DATABASE_URL is set)
+    let db_url = std::env::var("DATABASE_URL").ok();
+    let db = if let Some(url) = db_url {
+        tracing::info!("Connecting to PostgreSQL Database...");
+        match sqlx::postgres::PgPoolOptions::new()
+            .max_connections(5)
+            .acquire_timeout(std::time::Duration::from_secs(3))
+            .connect(&url)
+            .await
+        {
+            Ok(pool) => {
+                // Initialize database tables on startup
+                sqlx::query(
+                    r#"
+                    CREATE TABLE IF NOT EXISTS file_uploads (
+                        file_id UUID PRIMARY KEY,
+                        file_name VARCHAR(255) NOT NULL,
+                        mime_type VARCHAR(255) NOT NULL,
+                        size_bytes BIGINT NOT NULL,
+                        storage_path VARCHAR(255) NOT NULL,
+                        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+                    );
+                    "#
+                )
+                .execute(&pool)
+                .await
+                .expect("Failed to initialize file_uploads table");
+
+                sqlx::query(
+                    r#"
+                    CREATE TABLE IF NOT EXISTS submissions (
+                        id UUID PRIMARY KEY,
+                        title VARCHAR(255) NOT NULL,
+                        description TEXT NOT NULL,
+                        category VARCHAR(100) NOT NULL,
+                        priority VARCHAR(50) NOT NULL,
+                        tags TEXT[] NOT NULL,
+                        file_id UUID REFERENCES file_uploads(file_id),
+                        file_name VARCHAR(255),
+                        file_mime_type VARCHAR(255),
+                        file_size_bytes BIGINT,
+                        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+                    );
+                    "#
+                )
+                .execute(&pool)
+                .await
+                .expect("Failed to initialize submissions table");
+
+                tracing::info!("PostgreSQL connection live and tables initialized!");
+                Some(pool)
+            }
+            Err(e) => {
+                tracing::warn!("PostgreSQL connection failed (falling back to memory): {}", e);
+                None
+            }
+        }
+    } else {
+        tracing::info!("No DATABASE_URL set. Storing submissions in-memory.");
+        None
+    };
+
+    // 2. Initialize S3 / MinIO (if credentials are set)
+    let s3_endpoint = std::env::var("S3_ENDPOINT").ok();
+    let s3_access_key = std::env::var("S3_ACCESS_KEY").ok();
+    let s3_secret_key = std::env::var("S3_SECRET_KEY").ok();
+    let s3_bucket = std::env::var("S3_BUCKET").unwrap_or_else(|_| "hack-bucket".to_string());
+
+    let s3_client = if let (Some(endpoint), Some(access_key), Some(secret_key)) = (s3_endpoint, s3_access_key, s3_secret_key) {
+        tracing::info!("Connecting to S3/MinIO bucket [{}] at endpoint [{}]...", s3_bucket, endpoint);
+        
+        let credentials = aws_sdk_s3::config::Credentials::new(
+            access_key,
+            secret_key,
+            None,
+            None,
+            "env",
+        );
+        
+        let config = aws_config::defaults(BehaviorVersion::latest())
+            .credentials_provider(credentials)
+            .region(aws_config::Region::new("us-east-1"))
+            .endpoint_url(endpoint)
+            .load()
+            .await;
+            
+        let s3_config = aws_sdk_s3::config::Builder::from(&config)
+            .force_path_style(true)
+            .build();
+            
+        Some(aws_sdk_s3::Client::from_conf(s3_config))
+    } else {
+        tracing::info!("S3/MinIO credentials missing. Saving uploads to local disk.");
+        None
+    };
+
     // Initialize state
     let state = AppState {
-        submissions: Arc::new(RwLock::new(Vec::new())),
-        uploads: Arc::new(RwLock::new(HashMap::new())),
+        db,
+        s3_client,
+        s3_bucket,
+        submissions_mem: Arc::new(RwLock::new(Vec::new())),
+        uploads_mem: Arc::new(RwLock::new(HashMap::new())),
     };
 
     // Configure CORS
     let allowed_origins_env = std::env::var("ALLOWED_ORIGINS").ok();
     let cors = if let Some(origins_str) = allowed_origins_env {
-        let mut origins = Vec::new();
-        for origin in origins_str.split(',') {
-            if let Ok(value) = origin.trim().parse::<axum::http::HeaderValue>() {
-                origins.push(value);
+        let trimmed = origins_str.trim();
+        if trimmed.is_empty() {
+            CorsLayer::permissive()
+        } else {
+            let mut origins = Vec::new();
+            for origin in trimmed.split(',') {
+                let trimmed_origin = origin.trim();
+                if !trimmed_origin.is_empty() {
+                    if let Ok(value) = trimmed_origin.parse::<axum::http::HeaderValue>() {
+                        origins.push(value);
+                    }
+                }
+            }
+            if origins.is_empty() {
+                CorsLayer::permissive()
+            } else {
+                CorsLayer::new()
+                    .allow_origin(origins)
+                    .allow_methods(Any)
+                    .allow_headers(Any)
             }
         }
-        if origins.is_empty() {
-            CorsLayer::new()
-                .allow_origin(Any)
-                .allow_methods(Any)
-                .allow_headers(Any)
-        } else {
-            CorsLayer::new()
-                .allow_origin(origins)
-                .allow_methods(Any)
-                .allow_headers(Any)
-        }
     } else {
-        CorsLayer::new()
-            .allow_origin(Any)
-            .allow_methods(Any)
-            .allow_headers(Any)
+        CorsLayer::permissive()
     };
 
     // Build routes
@@ -212,8 +324,8 @@ async fn main() {
         .route("/api/upload", post(upload_file))
         .route("/api/files/{id}", get(get_file))
         .route("/api/submissions", post(create_submission).get(list_submissions))
-        .layer(cors)
-        .with_state(state);
+        .with_state(state)
+        .layer(cors);
 
     // Determine port and bind
     let port = std::env::var("PORT")
@@ -229,8 +341,31 @@ async fn main() {
 }
 
 // GET /health
-async fn health_check() -> impl IntoResponse {
-    (StatusCode::OK, Json(serde_json::json!({ "status": "ok" })))
+async fn health_check(State(state): State<AppState>) -> impl IntoResponse {
+    let mut db_status = "unconfigured";
+    if let Some(ref pool) = state.db {
+        db_status = match sqlx::query("SELECT 1").execute(pool).await {
+            Ok(_) => "ok",
+            Err(_) => "error",
+        };
+    }
+
+    let mut s3_status = "unconfigured";
+    if let Some(ref s3) = state.s3_client {
+        s3_status = match s3.list_buckets().send().await {
+            Ok(_) => "ok",
+            Err(_) => "error",
+        };
+    }
+
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({
+            "status": "ok",
+            "postgres": db_status,
+            "s3_minio": s3_status
+        })),
+    )
 }
 
 // POST /api/upload
@@ -310,30 +445,74 @@ async fn upload_file(
     let file_id = Uuid::new_v4();
     let storage_filename = format!("{}_{}", file_id, file_name);
     let storage_path = format!("./uploads/{}", storage_filename);
-
-    tokio::fs::write(&storage_path, &file_data).await.map_err(|e| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(ErrorResponse {
-                error: "Failed to save file".to_string(),
-                details: vec![ValidationError {
-                    field: "file".to_string(),
-                    message: e.to_string(),
-                }],
-            }),
-        )
-            .into_response()
-    })?;
-
+    let file_size = file_data.len();
     let meta = UploadMetadata {
         file_id,
         file_name: file_name.clone(),
         mime_type: content_type.clone(),
-        size_bytes: file_data.len(),
-        storage_path,
+        size_bytes: file_size,
+        storage_path: storage_filename.clone(),
     };
 
-    state.uploads.write().await.insert(file_id, meta);
+    if let Some(ref s3) = state.s3_client {
+        let body = ByteStream::from(file_data.clone());
+        s3.put_object()
+            .bucket(&state.s3_bucket)
+            .key(&storage_filename)
+            .body(body)
+            .content_type(&content_type)
+            .send()
+            .await
+            .map_err(|e| {
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(ErrorResponse {
+                        error: "S3 upload failed".to_string(),
+                        details: vec![ValidationError {
+                            field: "s3".to_string(),
+                            message: e.to_string(),
+                        }],
+                    }),
+                )
+                    .into_response()
+            })?;
+    } else {
+        tokio::fs::write(&storage_path, &file_data).await.map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ErrorResponse {
+                    error: "Failed to save file locally".to_string(),
+                    details: vec![ValidationError {
+                        field: "file".to_string(),
+                        message: e.to_string(),
+                    }],
+                }),
+            )
+                .into_response()
+        })?;
+    }
+
+    // Save metadata in postgres if pool is initialized
+    if let Some(ref pool) = state.db {
+        if let Err(e) = sqlx::query(
+            r#"
+            INSERT INTO file_uploads (file_id, file_name, mime_type, size_bytes, storage_path)
+            VALUES ($1, $2, $3, $4, $5)
+            "#
+        )
+        .bind(file_id)
+        .bind(&file_name)
+        .bind(&content_type)
+        .bind(file_size as i64)
+        .bind(&meta.storage_path)
+        .execute(pool)
+        .await
+        {
+            tracing::error!("Failed to persist file upload metadata in Postgres: {}", e);
+        }
+    }
+
+    state.uploads_mem.write().await.insert(file_id, meta);
 
     Ok((
         StatusCode::OK,
@@ -341,7 +520,7 @@ async fn upload_file(
             file_id,
             file_name,
             mime_type: content_type,
-            size_bytes: file_data.len(),
+            size_bytes: file_size,
         }),
     ))
 }
@@ -368,29 +547,104 @@ async fn get_file(
         }
     };
 
-    let uploads = state.uploads.read().await;
-    if let Some(meta) = uploads.get(&file_id) {
-        match tokio::fs::read(&meta.storage_path).await {
-            Ok(bytes) => {
-                (
-                    StatusCode::OK,
-                    [(axum::http::header::CONTENT_TYPE, meta.mime_type.clone())],
-                    bytes,
-                )
-                    .into_response()
+    // Retrieve file metadata from Postgres first, falling back to memory
+    let meta = {
+        let mut resolved = None;
+        if let Some(ref pool) = state.db {
+            if let Ok(Some(row)) = sqlx::query(
+                "SELECT file_id, file_name, mime_type, size_bytes, storage_path FROM file_uploads WHERE file_id = $1"
+            )
+            .bind(file_id)
+            .fetch_optional(pool)
+            .await
+            {
+                resolved = Some(UploadMetadata {
+                    file_id: row.get("file_id"),
+                    file_name: row.get("file_name"),
+                    mime_type: row.get("mime_type"),
+                    size_bytes: row.get::<i64, _>("size_bytes") as usize,
+                    storage_path: row.get("storage_path"),
+                });
             }
-            Err(e) => {
-                (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    Json(ErrorResponse {
-                        error: "File read error".to_string(),
-                        details: vec![ValidationError {
-                            field: "file".to_string(),
-                            message: e.to_string(),
-                        }],
-                    }),
-                )
-                    .into_response()
+        }
+        if resolved.is_none() {
+            resolved = state.uploads_mem.read().await.get(&file_id).cloned();
+        }
+        resolved
+    };
+
+    if let Some(meta) = meta {
+        // Stream from S3 or read from Disk
+        if let Some(ref s3) = state.s3_client {
+            match s3.get_object()
+                .bucket(&state.s3_bucket)
+                .key(&meta.storage_path)
+                .send()
+                .await
+            {
+                Ok(output) => {
+                    match output.body.collect().await {
+                        Ok(collected) => {
+                            (
+                                StatusCode::OK,
+                                [(axum::http::header::CONTENT_TYPE, meta.mime_type.clone())],
+                                collected.into_bytes(),
+                            )
+                                .into_response()
+                        }
+                        Err(e) => {
+                            (
+                                StatusCode::INTERNAL_SERVER_ERROR,
+                                Json(ErrorResponse {
+                                    error: "Failed to read S3 object stream".to_string(),
+                                    details: vec![ValidationError {
+                                        field: "s3".to_string(),
+                                        message: e.to_string(),
+                                    }],
+                                }),
+                            )
+                                .into_response()
+                        }
+                    }
+                }
+                Err(e) => {
+                    (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        Json(ErrorResponse {
+                            error: "S3 download request failed".to_string(),
+                            details: vec![ValidationError {
+                                field: "s3".to_string(),
+                                message: e.to_string(),
+                            }],
+                        }),
+                    )
+                        .into_response()
+                }
+            }
+        } else {
+            let local_path = format!("./uploads/{}", meta.storage_path);
+            match tokio::fs::read(&local_path).await {
+                Ok(bytes) => {
+                    (
+                        StatusCode::OK,
+                        [(axum::http::header::CONTENT_TYPE, meta.mime_type.clone())],
+                        bytes,
+                    )
+                        .into_response()
+                }
+                Err(e) => {
+                    (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        Json(ErrorResponse {
+                            error: "File read error".to_string(),
+                            details: vec![ValidationError {
+                                field: "disk".to_string(),
+                                message: e.to_string(),
+                            }],
+                        }),
+                    )
+                        .into_response()
+                }
             }
         }
     } else {
@@ -604,14 +858,38 @@ async fn create_submission(
                 if !s.is_empty() {
                     match Uuid::parse_str(&s) {
                         Ok(uid) => {
-                            let uploads = state.uploads.read().await;
-                            if let Some(meta) = uploads.get(&uid) {
-                                file_info = Some(UploadedFile {
-                                    file_id: meta.file_id,
-                                    file_name: meta.file_name.clone(),
-                                    mime_type: meta.mime_type.clone(),
-                                    size_bytes: meta.size_bytes,
-                                });
+                            // Resolve metadata from Postgres or Memory
+                            let meta = {
+                                let mut resolved = None;
+                                if let Some(ref pool) = state.db {
+                                    if let Ok(Some(row)) = sqlx::query(
+                                        "SELECT file_id, file_name, mime_type, size_bytes FROM file_uploads WHERE file_id = $1"
+                                    )
+                                    .bind(uid)
+                                    .fetch_optional(pool)
+                                    .await
+                                    {
+                                        resolved = Some(UploadedFile {
+                                            file_id: row.get("file_id"),
+                                            file_name: row.get("file_name"),
+                                            mime_type: row.get("mime_type"),
+                                            size_bytes: row.get::<i64, _>("size_bytes") as usize,
+                                        });
+                                    }
+                                }
+                                if resolved.is_none() {
+                                    resolved = state.uploads_mem.read().await.get(&uid).map(|m| UploadedFile {
+                                        file_id: m.file_id,
+                                        file_name: m.file_name.clone(),
+                                        mime_type: m.mime_type.clone(),
+                                        size_bytes: m.size_bytes,
+                                    });
+                                }
+                                resolved
+                            };
+
+                            if let Some(info) = meta {
+                                file_info = Some(info);
                             } else {
                                 details.push(ValidationError {
                                     field: "file_id".to_string(),
@@ -654,12 +932,49 @@ async fn create_submission(
         description: description.unwrap(),
         category: category.unwrap(),
         priority: priority.unwrap(),
-        tags,
-        file_info,
+        tags: tags.clone(),
+        file_info: file_info.clone(),
         created_at: Utc::now(),
     };
 
-    state.submissions.write().await.push(submission.clone());
+    // Save to Database (Postgres) or Memory fallback
+    if let Some(ref pool) = state.db {
+        let tag_array = tags;
+        if let Err(e) = sqlx::query(
+            r#"
+            INSERT INTO submissions (id, title, description, category, priority, tags, file_id, file_name, file_mime_type, file_size_bytes, created_at)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+            "#
+        )
+        .bind(submission.id)
+        .bind(&submission.title)
+        .bind(&submission.description)
+        .bind(serde_json::to_string(&submission.category).unwrap_or_default().replace('"', ""))
+        .bind(format!("{:?}", submission.priority))
+        .bind(&tag_array)
+        .bind(file_info.as_ref().map(|f| f.file_id))
+        .bind(file_info.as_ref().map(|f| &f.file_name))
+        .bind(file_info.as_ref().map(|f| &f.mime_type))
+        .bind(file_info.as_ref().map(|f| f.size_bytes as i64))
+        .bind(submission.created_at)
+        .execute(pool)
+        .await
+        {
+            return Err((
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ErrorResponse {
+                    error: "Failed to persist submission in Postgres".to_string(),
+                    details: vec![ValidationError {
+                        field: "database".to_string(),
+                        message: e.to_string(),
+                    }],
+                }),
+            )
+                .into_response());
+        }
+    } else {
+        state.submissions_mem.write().await.push(submission.clone());
+    }
 
     Ok((StatusCode::CREATED, Json(submission)))
 }
@@ -672,10 +987,67 @@ async fn list_submissions(
     let offset = params.offset.unwrap_or(0);
     let limit = params.limit.unwrap_or(10);
 
-    let list = state.submissions.read().await;
+    // Retrieve submissions from Postgres first, falling back to memory
+    let db_submissions = if let Some(ref pool) = state.db {
+        match sqlx::query(
+            "SELECT id, title, description, category, priority, tags, file_id, file_name, file_mime_type, file_size_bytes, created_at FROM submissions"
+        )
+        .fetch_all(pool)
+        .await
+        {
+            Ok(rows) => {
+                let mut list = Vec::new();
+                for row in rows {
+                    let id: Uuid = row.get("id");
+                    let title: String = row.get("title");
+                    let description: String = row.get("description");
+                    let category_str: String = row.get("category");
+                    let priority_str: String = row.get("priority");
+                    let tags: Vec<String> = row.get("tags");
+                    let file_id: Option<Uuid> = row.get("file_id");
+                    let file_name: Option<String> = row.get("file_name");
+                    let file_mime_type: Option<String> = row.get("file_mime_type");
+                    let file_size_bytes: Option<i64> = row.get("file_size_bytes");
+                    let created_at: DateTime<Utc> = row.get("created_at");
+
+                    let category = Category::from_str(&category_str).unwrap_or(Category::Other);
+                    let priority = Priority::from_str(&priority_str).unwrap_or(Priority::Medium);
+
+                    let file_info = if let (Some(fid), Some(fname), Some(fmime), Some(fsize)) = (file_id, file_name, file_mime_type, file_size_bytes) {
+                        Some(UploadedFile {
+                            file_id: fid,
+                            file_name: fname,
+                            mime_type: fmime,
+                            size_bytes: fsize as usize,
+                        })
+                    } else {
+                        None
+                    };
+
+                    list.push(Submission {
+                        id,
+                        title,
+                        description,
+                        category,
+                        priority,
+                        tags,
+                        file_info,
+                        created_at,
+                    });
+                }
+                list
+            }
+            Err(e) => {
+                tracing::error!("Failed to fetch submissions from Postgres: {}", e);
+                Vec::new()
+            }
+        }
+    } else {
+        state.submissions_mem.read().await.clone()
+    };
 
     // Apply filtering
-    let mut filtered: Vec<Submission> = list.clone();
+    let mut filtered = db_submissions;
 
     if let Some(cat_filter) = params.category {
         if !cat_filter.trim().is_empty() {

@@ -1,5 +1,5 @@
 # Build Stage
-FROM rust:1.95-slim AS builder
+FROM rust:1.95-bookworm-slim AS builder
 WORKDIR /usr/src/app
 COPY . .
 RUN cargo build --release

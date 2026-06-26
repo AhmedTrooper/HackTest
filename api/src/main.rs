@@ -2,7 +2,7 @@ use axum::{
     extract::{FromRequest, Path, Query, Request, State},
     http::StatusCode,
     response::{IntoResponse, Response},
-    routing::{get, post},
+    routing::{get, post, delete},
     Json, Router,
 };
 use axum::extract::Multipart;
@@ -322,8 +322,10 @@ async fn main() {
     let app = Router::new()
         .route("/health", get(health_check))
         .route("/api/upload", post(upload_file))
-        .route("/api/files/{id}", get(get_file))
+        .route("/api/files/cleanup", post(cleanup_orphaned_files))
+        .route("/api/files/{id}", get(get_file).delete(delete_file))
         .route("/api/submissions", post(create_submission).get(list_submissions))
+        .route("/api/submissions/{id}", delete(delete_submission))
         .with_state(state)
         .layer(cors);
 
@@ -1093,4 +1095,401 @@ async fn list_submissions(
         offset,
         limit,
     })
+}
+
+// DELETE /api/submissions/{id}
+async fn delete_submission(
+    State(state): State<AppState>,
+    Path(id_str): Path<String>,
+) -> impl IntoResponse {
+    let sub_id = match Uuid::parse_str(&id_str) {
+        Ok(uid) => uid,
+        Err(_) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(ErrorResponse {
+                    error: "Invalid submission ID".to_string(),
+                    details: vec![ValidationError {
+                        field: "id".to_string(),
+                        message: "Must be a valid UUID".to_string(),
+                    }],
+                }),
+            )
+                .into_response();
+        }
+    };
+
+    // 1. Get file_id from submission to know if we need to clean up an attachment
+    let mut file_id_to_delete = None;
+    let mut file_path_to_delete = None;
+    let mut found = false;
+
+    if let Some(ref pool) = state.db {
+        let row = sqlx::query("SELECT file_id FROM submissions WHERE id = $1")
+            .bind(sub_id)
+            .fetch_optional(pool)
+            .await
+            .ok()
+            .flatten();
+            
+        if let Some(r) = row {
+            found = true;
+            file_id_to_delete = r.get::<Option<Uuid>, _>("file_id");
+        }
+    } else {
+        let list = state.submissions_mem.read().await;
+        if let Some(sub) = list.iter().find(|s| s.id == sub_id) {
+            found = true;
+            file_id_to_delete = sub.file_info.as_ref().map(|f| f.file_id);
+        }
+    }
+
+    if !found {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(ErrorResponse {
+                error: "Submission not found".to_string(),
+                details: vec![ValidationError {
+                    field: "id".to_string(),
+                    message: "No submission matches the provided ID".to_string(),
+                }],
+            }),
+        )
+            .into_response();
+    }
+
+    // 2. Fetch the S3 storage path / local filename if we have a file_id to delete
+    if let Some(file_id) = file_id_to_delete {
+        if let Some(ref pool) = state.db {
+            let row = sqlx::query("SELECT storage_path FROM file_uploads WHERE file_id = $1")
+                .bind(file_id)
+                .fetch_optional(pool)
+                .await
+                .ok()
+                .flatten();
+            if let Some(r) = row {
+                file_path_to_delete = Some(r.get::<String, _>("storage_path"));
+            }
+        } else {
+            let uploads = state.uploads_mem.read().await;
+            if let Some(m) = uploads.get(&file_id) {
+                file_path_to_delete = Some(m.storage_path.clone());
+            }
+        }
+    }
+
+    // 3. Delete from submissions table / memory
+    if let Some(ref pool) = state.db {
+        if let Err(e) = sqlx::query("DELETE FROM submissions WHERE id = $1")
+            .bind(sub_id)
+            .execute(pool)
+            .await
+        {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ErrorResponse {
+                    error: "Failed to delete submission".to_string(),
+                    details: vec![ValidationError {
+                        field: "database".to_string(),
+                        message: e.to_string(),
+                    }],
+                }),
+            )
+                .into_response();
+        }
+    } else {
+        let mut list = state.submissions_mem.write().await;
+        list.retain(|s| s.id != sub_id);
+    }
+
+    // 4. Delete file from storage and file_uploads database / memory
+    if let Some(file_id) = file_id_to_delete {
+        if let Some(ref path) = file_path_to_delete {
+            if let Some(ref s3) = state.s3_client {
+                // Delete from S3
+                if let Err(e) = s3.delete_object()
+                    .bucket(&state.s3_bucket)
+                    .key(path)
+                    .send()
+                    .await
+                {
+                    tracing::error!("Failed to delete file {} from S3: {}", path, e);
+                }
+            } else {
+                // Delete from local disk
+                let local_path = format!("./uploads/{}", path);
+                if let Err(e) = tokio::fs::remove_file(&local_path).await {
+                    tracing::error!("Failed to delete local file {}: {}", local_path, e);
+                }
+            }
+        }
+
+        // Delete metadata from database / memory
+        if let Some(ref pool) = state.db {
+            if let Err(e) = sqlx::query("DELETE FROM file_uploads WHERE file_id = $1")
+                .bind(file_id)
+                .execute(pool)
+                .await
+            {
+                tracing::error!("Failed to delete file upload metadata from Postgres: {}", e);
+            }
+        }
+        state.uploads_mem.write().await.remove(&file_id);
+    }
+
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({
+            "message": "Submission and associated files deleted successfully",
+            "id": sub_id
+        })),
+    )
+        .into_response()
+}
+
+// DELETE /api/files/{id}
+async fn delete_file(
+    State(state): State<AppState>,
+    Path(id_str): Path<String>,
+) -> impl IntoResponse {
+    let file_id = match Uuid::parse_str(&id_str) {
+        Ok(uid) => uid,
+        Err(_) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(ErrorResponse {
+                    error: "Invalid file ID".to_string(),
+                    details: vec![ValidationError {
+                        field: "id".to_string(),
+                        message: "Must be a valid UUID".to_string(),
+                    }],
+                }),
+            )
+                .into_response();
+        }
+    };
+
+    // 1. Check if the file is referenced by any submission
+    let is_referenced = if let Some(ref pool) = state.db {
+        match sqlx::query("SELECT COUNT(*) FROM submissions WHERE file_id = $1")
+            .bind(file_id)
+            .fetch_one(pool)
+            .await
+        {
+            Ok(row) => {
+                let count: i64 = row.get(0);
+                count > 0
+            }
+            Err(e) => {
+                tracing::error!("Failed to check if file is referenced in Postgres: {}", e);
+                true // Err on the side of safety
+            }
+        }
+    } else {
+        let list = state.submissions_mem.read().await;
+        list.iter().any(|s| s.file_info.as_ref().map(|f| f.file_id) == Some(file_id))
+    };
+
+    if is_referenced {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(ErrorResponse {
+                error: "File is in use".to_string(),
+                details: vec![ValidationError {
+                    field: "id".to_string(),
+                    message: "Cannot delete file because it is referenced by a submission".to_string(),
+                }],
+            }),
+        )
+            .into_response();
+    }
+
+    // 2. Fetch storage path
+    let storage_path = {
+        let mut path = None;
+        if let Some(ref pool) = state.db {
+            if let Ok(Some(row)) = sqlx::query("SELECT storage_path FROM file_uploads WHERE file_id = $1")
+                .bind(file_id)
+                .fetch_optional(pool)
+                .await
+            {
+                path = Some(row.get::<String, _>("storage_path"));
+            }
+        }
+        if path.is_none() {
+            path = state.uploads_mem.read().await.get(&file_id).map(|m| m.storage_path.clone());
+        }
+        path
+    };
+
+    let path = match storage_path {
+        Some(p) => p,
+        None => {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(ErrorResponse {
+                    error: "File not found".to_string(),
+                    details: vec![ValidationError {
+                        field: "id".to_string(),
+                        message: "No upload record matches the provided ID".to_string(),
+                    }],
+                }),
+            )
+                .into_response();
+        }
+    };
+
+    // 3. Delete from S3 or local disk
+    if let Some(ref s3) = state.s3_client {
+        if let Err(e) = s3.delete_object()
+            .bucket(&state.s3_bucket)
+            .key(&path)
+            .send()
+            .await
+        {
+            tracing::error!("Failed to delete file {} from S3: {}", path, e);
+        }
+    } else {
+        let local_path = format!("./uploads/{}", path);
+        if let Err(e) = tokio::fs::remove_file(&local_path).await {
+            tracing::error!("Failed to delete local file {}: {}", local_path, e);
+        }
+    }
+
+    // 4. Delete metadata from database / memory
+    if let Some(ref pool) = state.db {
+        if let Err(e) = sqlx::query("DELETE FROM file_uploads WHERE file_id = $1")
+            .bind(file_id)
+            .execute(pool)
+            .await
+        {
+            tracing::error!("Failed to delete file upload metadata from Postgres: {}", e);
+        }
+    }
+    state.uploads_mem.write().await.remove(&file_id);
+
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({
+            "message": "File deleted successfully",
+            "id": file_id
+        })),
+    )
+        .into_response()
+}
+
+// POST /api/files/cleanup
+async fn cleanup_orphaned_files(
+    State(state): State<AppState>,
+) -> impl IntoResponse {
+    let mut orphaned_files = Vec::new();
+
+    // 1. Find all files that are not referenced by any submission
+    if let Some(ref pool) = state.db {
+        match sqlx::query(
+            r#"
+            SELECT f.file_id, f.storage_path 
+            FROM file_uploads f
+            LEFT JOIN submissions s ON f.file_id = s.file_id
+            WHERE s.file_id IS NULL
+            "#
+        )
+        .fetch_all(pool)
+        .await
+        {
+            Ok(rows) => {
+                for row in rows {
+                    let file_id: Uuid = row.get("file_id");
+                    let storage_path: String = row.get("storage_path");
+                    orphaned_files.push((file_id, storage_path));
+                }
+            }
+            Err(e) => {
+                tracing::error!("Failed to fetch orphaned files from Postgres: {}", e);
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(serde_json::json!({
+                        "error": "Failed to query database for orphaned files",
+                        "details": e.to_string()
+                    })),
+                )
+                    .into_response();
+            }
+        }
+    } else {
+        // In-memory fallback
+        let submissions = state.submissions_mem.read().await;
+        let uploads = state.uploads_mem.read().await;
+        for (file_id, meta) in uploads.iter() {
+            let is_referenced = submissions.iter().any(|s| s.file_info.as_ref().map(|f| f.file_id) == Some(*file_id));
+            if !is_referenced {
+                orphaned_files.push((*file_id, meta.storage_path.clone()));
+            }
+        }
+    }
+
+    let total_found = orphaned_files.len();
+    let mut deleted_count = 0;
+
+    // 2. Delete each orphaned file from storage and database/memory
+    for (file_id, path) in orphaned_files {
+        let mut storage_deleted = false;
+        if let Some(ref s3) = state.s3_client {
+            match s3.delete_object()
+                .bucket(&state.s3_bucket)
+                .key(&path)
+                .send()
+                .await
+            {
+                Ok(_) => {
+                    storage_deleted = true;
+                }
+                Err(e) => {
+                    tracing::error!("Failed to delete orphaned S3 object {}: {}", path, e);
+                }
+            }
+        } else {
+            let local_path = format!("./uploads/{}", path);
+            match tokio::fs::remove_file(&local_path).await {
+                Ok(_) => {
+                    storage_deleted = true;
+                }
+                Err(e) => {
+                    // If file is already gone, count it as deleted to clean up database entry
+                    if e.kind() == std::io::ErrorKind::NotFound {
+                        storage_deleted = true;
+                    } else {
+                        tracing::error!("Failed to delete local orphaned file {}: {}", local_path, e);
+                    }
+                }
+            }
+        }
+
+        if storage_deleted {
+            if let Some(ref pool) = state.db {
+                if let Err(e) = sqlx::query("DELETE FROM file_uploads WHERE file_id = $1")
+                    .bind(file_id)
+                    .execute(pool)
+                    .await
+                {
+                    tracing::error!("Failed to delete orphaned file metadata from Postgres: {}", e);
+                } else {
+                    deleted_count += 1;
+                }
+            } else {
+                state.uploads_mem.write().await.remove(&file_id);
+                deleted_count += 1;
+            }
+        }
+    }
+
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({
+            "message": "Orphaned files cleanup completed",
+            "found": total_found,
+            "deleted": deleted_count
+        })),
+    )
+        .into_response()
 }

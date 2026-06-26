@@ -14,6 +14,7 @@ import {
 	Settings,
 	Tag,
 	Upload,
+	Trash2,
 } from "lucide-react";
 import type React from "react";
 import { useEffect, useState, useCallback } from "react";
@@ -83,6 +84,8 @@ function SubmissionsDashboard() {
 		null,
 	);
 	const [uploadProgress, setUploadProgress] = useState(0);
+
+	const [isCleaning, setIsCleaning] = useState(false);
 
 	// Feedback states
 	const [formErrors, setFormErrors] = useState<ValidationError[]>([]);
@@ -168,6 +171,17 @@ function SubmissionsDashboard() {
 			return;
 		}
 
+		// Delete previously uploaded file from the server to avoid orphan file leaks
+		if (uploadedFileMeta) {
+			try {
+				await fetch(`${backendUrl}/api/files/${uploadedFileMeta.file_id}`, {
+					method: "DELETE",
+				});
+			} catch (err) {
+				console.error("Failed to delete previously uploaded file:", err);
+			}
+		}
+
 		setGeneralError(null);
 		setSelectedFile(file);
 		setIsUploading(true);
@@ -199,6 +213,57 @@ function SubmissionsDashboard() {
 			setSelectedFile(null);
 		} finally {
 			setIsUploading(false);
+		}
+	};
+
+	// Handle manual file removal from the form before submission
+	const handleRemoveUploadedFile = async () => {
+		if (!uploadedFileMeta) return;
+
+		setIsUploading(true);
+		try {
+			const response = await fetch(
+				`${backendUrl}/api/files/${uploadedFileMeta.file_id}`,
+				{
+					method: "DELETE",
+				},
+			);
+			if (!response.ok) {
+				throw new Error("Failed to delete file from server");
+			}
+			setSelectedFile(null);
+			setUploadedFileMeta(null);
+			setUploadProgress(0);
+			setSuccessMessage("Uploaded file removed successfully.");
+			setTimeout(() => setSuccessMessage(null), 3000);
+		} catch (err: any) {
+			setGeneralError(err.message || "Failed to remove uploaded file.");
+		} finally {
+			setIsUploading(false);
+		}
+	};
+
+	// Handle cleanup of orphaned files from server storage
+	const handleCleanupOrphaned = async () => {
+		setIsCleaning(true);
+		setGeneralError(null);
+		setSuccessMessage(null);
+		try {
+			const response = await fetch(`${backendUrl}/api/files/cleanup`, {
+				method: "POST",
+			});
+			if (!response.ok) {
+				throw new Error("Failed to clean up files");
+			}
+			const data = await response.json();
+			setSuccessMessage(
+				`Cleanup complete! Found ${data.found} orphaned files, deleted ${data.deleted}.`,
+			);
+			setTimeout(() => setSuccessMessage(null), 5000);
+		} catch (err: any) {
+			setGeneralError(err.message || "Failed to clean up orphaned files.");
+		} finally {
+			setIsCleaning(false);
 		}
 	};
 
@@ -270,6 +335,31 @@ function SubmissionsDashboard() {
 			);
 		} finally {
 			setIsSubmitting(false);
+		}
+	};
+
+	const handleDelete = async (id: string) => {
+		if (!window.confirm("Are you sure you want to delete this submission and its attached file?")) {
+			return;
+		}
+
+		try {
+			const response = await fetch(`${backendUrl}/api/submissions/${id}`, {
+				method: "DELETE",
+			});
+
+			if (response.ok) {
+				setSuccessMessage("Submission deleted successfully!");
+				fetchSubmissions();
+				setTimeout(() => setSuccessMessage(null), 3000);
+			} else {
+				const errData = await response.json();
+				setGeneralError(errData.error || "Failed to delete submission");
+			}
+		} catch (err: any) {
+			setGeneralError(
+				err.message || "Failed to delete submission. Connection error.",
+			);
 		}
 	};
 
@@ -403,6 +493,34 @@ function SubmissionsDashboard() {
 										</>
 									)}
 								</div>
+							</div>
+							<div className="md:col-span-3 border-t border-[var(--line)] pt-4 mt-2 flex flex-col sm:flex-row sm:items-center sm:justify-between gap-4">
+								<div>
+									<h4 className="text-xs font-bold text-[var(--sea-ink)] uppercase tracking-wider">
+										Storage Maintenance
+									</h4>
+									<p className="text-[11px] text-slate-400 mt-0.5">
+										Delete files that were uploaded but never attached to a submission.
+									</p>
+								</div>
+								<button
+									type="button"
+									onClick={handleCleanupOrphaned}
+									disabled={isCleaning}
+									className="px-4 py-2 rounded-lg bg-amber-600 hover:bg-amber-700 disabled:opacity-50 text-white text-xs font-bold transition flex items-center gap-1.5 self-start sm:self-auto cursor-pointer"
+								>
+									{isCleaning ? (
+										<>
+											<RefreshCw className="h-3.5 w-3.5 animate-spin" />
+											Cleaning...
+										</>
+									) : (
+										<>
+											<Trash2 className="h-3.5 w-3.5" />
+											Clean Up Orphaned Files
+										</>
+									)}
+								</button>
 							</div>
 						</div>
 					</div>
@@ -601,16 +719,26 @@ function SubmissionsDashboard() {
 												</div>
 											</div>
 
-											<div className="flex-shrink-0">
+											<div className="flex-shrink-0 flex items-center gap-2">
 												{isUploading ? (
 													<span className="text-[10px] bg-sky-500/10 text-sky-600 px-2 py-1 rounded font-medium animate-pulse">
 														Uploading ({uploadProgress}%)
 													</span>
 												) : uploadedFileMeta ? (
-													<span className="text-[10px] bg-emerald-500/10 text-emerald-600 px-2 py-1 rounded font-medium flex items-center gap-1">
-														<CheckCircle className="h-3.5 w-3.5" />
-														Ready
-													</span>
+													<>
+														<span className="text-[10px] bg-emerald-500/10 text-emerald-600 px-2 py-1 rounded font-medium flex items-center gap-1">
+															<CheckCircle className="h-3.5 w-3.5" />
+															Ready
+														</span>
+														<button
+															type="button"
+															onClick={handleRemoveUploadedFile}
+															className="p-1 rounded text-rose-500 hover:bg-rose-500/10 hover:text-rose-600 transition flex items-center justify-center cursor-pointer"
+															title="Remove uploaded file"
+														>
+															<Trash2 className="h-3.5 w-3.5" />
+														</button>
+													</>
 												) : (
 													<span className="text-[10px] bg-rose-500/10 text-rose-600 px-2 py-1 rounded font-medium">
 														Failed
@@ -777,6 +905,14 @@ function SubmissionsDashboard() {
 												>
 													{sub.priority}
 												</span>
+												<button
+													type="button"
+													onClick={() => handleDelete(sub.id)}
+													className="p-1 rounded text-rose-500 hover:bg-rose-500/10 hover:text-rose-600 transition flex items-center justify-center cursor-pointer"
+													title="Delete submission and attachment"
+												>
+													<Trash2 className="h-3.5 w-3.5" />
+												</button>
 											</div>
 										</div>
 

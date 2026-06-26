@@ -1,0 +1,34 @@
+# Ignore build outputs and cache directories everywhere in the project
+**/target/
+**/node_modules/
+**/.output/
+**/.tanstack/
+**/dist/
+**/build/
+**/.cache/
+
+# Ignore uploads directory where users upload test files
+**/uploads/
+
+# Ignore lock files anywhere in the workspace (as per user request)
+**/Cargo.lock
+**/bun.lock
+**/package-lock.json
+**/yarn.lock
+**/pnpm-lock.yaml
+
+# Ignore environment configurations and credentials
+**/.env
+**/.env.local
+**/.env.development.local
+**/.env.test.local
+**/.env.production.local
+
+# Ignore IDE settings
+**/.vscode/
+**/.idea/
+**/.DS_Store
+**/Thumbs.db
+
+#Additional
+edge.cases

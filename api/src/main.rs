@@ -298,7 +298,10 @@ async fn main() {
         } else {
             let mut origins = Vec::new();
             for origin in trimmed.split(',') {
-                let trimmed_origin = origin.trim();
+                let mut trimmed_origin = origin.trim();
+                while trimmed_origin.ends_with('/') {
+                    trimmed_origin = &trimmed_origin[..trimmed_origin.len() - 1];
+                }
                 if !trimmed_origin.is_empty() {
                     if let Ok(value) = trimmed_origin.parse::<axum::http::HeaderValue>() {
                         origins.push(value);

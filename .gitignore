@@ -10,12 +10,12 @@
 # Ignore uploads directory where users upload test files
 **/uploads/
 
-# Ignore lock files anywhere in the workspace (as per user request)
-**/Cargo.lock
-**/bun.lock
-**/package-lock.json
-**/yarn.lock
-**/pnpm-lock.yaml
+# Ignore lock files anywhere in the workspace (commented out for production tracking)
+# **/Cargo.lock
+# **/bun.lock
+# **/package-lock.json
+# **/yarn.lock
+# **/pnpm-lock.yaml
 
 # Ignore environment configurations and credentials
 **/.env

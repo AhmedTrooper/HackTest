@@ -13,11 +13,11 @@ import {
 	Search,
 	Settings,
 	Tag,
-	Upload,
 	Trash2,
+	Upload,
 } from "lucide-react";
 import type React from "react";
-import { useEffect, useState, useCallback } from "react";
+import { useCallback, useEffect, useState } from "react";
 
 export const Route = createFileRoute("/")({
 	component: SubmissionsDashboard,
@@ -56,15 +56,10 @@ const PRIORITIES = ["Low", "Medium", "High"];
 
 function SubmissionsDashboard() {
 	// State for backend connection
-	const [backendUrl, setBackendUrl] = useState(() => {
-		const defaultUrl = (import.meta.env.VITE_API_URL as string) || "http://localhost:8080";
-		if (typeof window !== "undefined") {
-			return (
-				localStorage.getItem("hack_backend_url") || defaultUrl
-			);
-		}
-		return defaultUrl;
-	});
+	const [backendUrlInput, setBackendUrlInput] = useState(
+		((import.meta.env.VITE_API_URL as string) || "http://localhost:8080").trim(),
+	);
+	const backendUrl = backendUrlInput.trim().replace(/\/+$/, "");
 	const [showSettings, setShowSettings] = useState(false);
 	const [connectionStatus, setConnectionStatus] = useState<
 		"unchecked" | "ok" | "failed"
@@ -106,23 +101,25 @@ function SubmissionsDashboard() {
 	const [priorityFilter, setPriorityFilter] = useState("");
 
 	// Check backend health
-	const checkHealth = useCallback(async (urlToCheck = backendUrl) => {
-		try {
-			const response = await fetch(`${urlToCheck}/health`);
-			const data = await response.json();
-			if (data && data.status === "ok") {
-				setConnectionStatus("ok");
-			} else {
+	const checkHealth = useCallback(
+		async (urlToCheck = backendUrl) => {
+			try {
+				const response = await fetch(`${urlToCheck}/health`);
+				const data = await response.json();
+				if (data && data.status === "ok") {
+					setConnectionStatus("ok");
+				} else {
+					setConnectionStatus("failed");
+				}
+			} catch (_e) {
 				setConnectionStatus("failed");
 			}
-		} catch (_e) {
-			setConnectionStatus("failed");
-		}
-	}, [backendUrl]);
+		},
+		[backendUrl],
+	);
 
-	// Effect to save backend URL and verify health
+	// Effect to verify health
 	useEffect(() => {
-		localStorage.setItem("hack_backend_url", backendUrl);
 		checkHealth();
 	}, [backendUrl, checkHealth]);
 
@@ -302,7 +299,7 @@ function SubmissionsDashboard() {
 
 			if (response.ok) {
 				// Success
-				const _newSubmission: Submission = await response.json();
+				await response.json();
 				setSuccessMessage("Submission added successfully!");
 
 				// Reset form
@@ -339,7 +336,11 @@ function SubmissionsDashboard() {
 	};
 
 	const handleDelete = async (id: string) => {
-		if (!window.confirm("Are you sure you want to delete this submission and its attached file?")) {
+		if (
+			!window.confirm(
+				"Are you sure you want to delete this submission and its attached file?",
+			)
+		) {
 			return;
 		}
 
@@ -439,15 +440,18 @@ function SubmissionsDashboard() {
 					<div className="mt-6 border-t border-[var(--line)] pt-6 fade-in">
 						<div className="grid md:grid-cols-3 gap-4 items-end">
 							<div className="md:col-span-2">
-								<label htmlFor="backend-url-input" className="block text-xs font-bold text-[var(--sea-ink-soft)] uppercase tracking-wider mb-2">
+								<label
+									htmlFor="backend-url-input"
+									className="block text-xs font-bold text-[var(--sea-ink-soft)] uppercase tracking-wider mb-2"
+								>
 									Backend API Root URL
 								</label>
 								<div className="relative">
 									<input
 										id="backend-url-input"
 										type="text"
-										value={backendUrl}
-										onChange={(e) => setBackendUrl(e.target.value)}
+										value={backendUrlInput}
+										onChange={(e) => setBackendUrlInput(e.target.value)}
 										className="w-full pl-3 pr-24 py-2 text-sm rounded-lg border border-[var(--line)] bg-white/70 dark:bg-black/10 text-[var(--sea-ink)] focus:outline-none focus:ring-2 focus:ring-[var(--lagoon)]"
 										placeholder="e.g. http://localhost:8080"
 									/>
@@ -500,7 +504,8 @@ function SubmissionsDashboard() {
 										Storage Maintenance
 									</h4>
 									<p className="text-[11px] text-slate-400 mt-0.5">
-										Delete files that were uploaded but never attached to a submission.
+										Delete files that were uploaded but never attached to a
+										submission.
 									</p>
 								</div>
 								<button
@@ -557,7 +562,10 @@ function SubmissionsDashboard() {
 						<form onSubmit={handleSubmit} className="space-y-4">
 							{/* Title input */}
 							<div>
-								<label htmlFor="title-input" className="block text-xs font-bold text-[var(--sea-ink-soft)] uppercase tracking-wider mb-1.5">
+								<label
+									htmlFor="title-input"
+									className="block text-xs font-bold text-[var(--sea-ink-soft)] uppercase tracking-wider mb-1.5"
+								>
 									Title <span className="text-rose-500">*</span>
 								</label>
 								<input
@@ -582,7 +590,10 @@ function SubmissionsDashboard() {
 
 							{/* Description textarea */}
 							<div>
-								<label htmlFor="description-input" className="block text-xs font-bold text-[var(--sea-ink-soft)] uppercase tracking-wider mb-1.5">
+								<label
+									htmlFor="description-input"
+									className="block text-xs font-bold text-[var(--sea-ink-soft)] uppercase tracking-wider mb-1.5"
+								>
 									Description <span className="text-rose-500">*</span>
 								</label>
 								<textarea
@@ -609,7 +620,10 @@ function SubmissionsDashboard() {
 							<div className="grid grid-cols-2 gap-4">
 								{/* Category select */}
 								<div>
-									<label htmlFor="category-select" className="block text-xs font-bold text-[var(--sea-ink-soft)] uppercase tracking-wider mb-1.5">
+									<label
+										htmlFor="category-select"
+										className="block text-xs font-bold text-[var(--sea-ink-soft)] uppercase tracking-wider mb-1.5"
+									>
 										Category
 									</label>
 									<select
@@ -633,7 +647,10 @@ function SubmissionsDashboard() {
 
 								{/* Priority select */}
 								<div>
-									<label htmlFor="priority-select" className="block text-xs font-bold text-[var(--sea-ink-soft)] uppercase tracking-wider mb-1.5">
+									<label
+										htmlFor="priority-select"
+										className="block text-xs font-bold text-[var(--sea-ink-soft)] uppercase tracking-wider mb-1.5"
+									>
 										Priority
 									</label>
 									<select
@@ -658,7 +675,10 @@ function SubmissionsDashboard() {
 
 							{/* Tags comma list */}
 							<div>
-								<label htmlFor="tags-input" className="block text-xs font-bold text-[var(--sea-ink-soft)] uppercase tracking-wider mb-1.5 flex items-center justify-between">
+								<label
+									htmlFor="tags-input"
+									className="block text-xs font-bold text-[var(--sea-ink-soft)] uppercase tracking-wider mb-1.5 flex items-center justify-between"
+								>
 									<span>Tags</span>
 									<span className="text-[10px] text-slate-400 lowercase italic">
 										comma separated
@@ -767,9 +787,7 @@ function SubmissionsDashboard() {
 							{/* Submit button */}
 							<button
 								type="submit"
-								disabled={
-									isSubmitting || isUploading
-								}
+								disabled={isSubmitting || isUploading}
 								className="w-full py-2.5 rounded-xl bg-[var(--sea-ink)] hover:bg-[var(--sea-ink-soft)] text-white font-bold text-sm shadow-sm transition disabled:opacity-50 flex items-center justify-center gap-2 cursor-pointer"
 							>
 								{isSubmitting ? (
